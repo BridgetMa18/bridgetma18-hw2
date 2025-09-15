@@ -3,11 +3,11 @@ import json
 import re
 import pytest
 import importlib
+import itertools
 
 # Import the Flask app and helpers from index.py
 index = importlib.import_module("index")
 app = index.app
-
 
 # ---------- Helpers used by tests ----------
 
@@ -315,3 +315,166 @@ def test_negative_decimal_to_base64_policy():
             back, err2 = api_convert(client, result, "base64", "decimal")
             assert err2 is None
             assert int(back) == -1
+
+
+
+def decimal_to_base64_little_endian(n: int) -> str:
+    if n == 0:
+        raw = b"\x00"
+    else:
+        byte_len = (n.bit_length() + 7) // 8
+        raw = n.to_bytes(byte_len, byteorder="little", signed=False)
+    return base64.b64encode(raw).decode("utf-8")
+
+NUMERIC_TYPES = ["binary", "octal", "decimal", "hexadecimal", "base64"]
+TEST_NUMBERS = [0, 1, 2, 7, 8, 15, 16, 42, 255, 256, 1024, 65535]
+
+def encode_for_type(n: int, t: str) -> str:
+    if t == "decimal":
+        return str(n)
+    if t == "binary":
+        return bin(n)[2:]
+    if t == "octal":
+        return oct(n)[2:]
+    if t == "hexadecimal":
+        return hex(n)[2:]
+    if t == "base64":
+        return decimal_to_base64_little_endian(n)
+    raise AssertionError(f"unknown type {t}")
+
+def test_readme_decimal_to_binary_example():
+    # "Convert decimal to binary: Input '42' decimal -> binary"
+    with app.test_client() as client:
+        result, err = api_convert(client, "42", "decimal", "binary")
+        assert err is None
+        assert result == "101010"
+
+def test_readme_text_to_decimal_example_expected_42():
+    # "Convert text to decimal: Input 'forty two' text -> decimal"
+    # If the implementation cannot parse "forty two", this SHOULD FAIL,
+    # surfacing a bug against the README spec.
+    with app.test_client() as client:
+        result, err = api_convert(client, "forty two", "text", "decimal")
+        assert err is None, f"Expected to parse 'forty two' → 42 per README, got error: {err}"
+        assert int(result) == 42
+
+def test_readme_hex_to_text_roundtrip_via_decimal():
+    # "Convert hexadecimal to text: Input '2a' hex -> text"
+    # Avoid asserting exact hyphenation; just check it round-trips to 42.
+    with app.test_client() as client:
+        text_out, err = api_convert(client, "2a", "hexadecimal", "text")
+        assert err is None
+        back_dec, err2 = api_convert(client, text_out, "text", "decimal")
+        assert err2 is None
+        assert int(back_dec) == 42
+
+
+# ---------- Base64 little-endian policy test ----------
+@pytest.mark.parametrize("n,expected_b64", [(258, "AgE="), (1, "AQ=="), (0, "AA==")])
+def test_base64_little_endian_expected_values(n, expected_b64):
+    """Verify base64 uses LITTLE-ENDIAN byte order as required."""
+    with app.test_client() as client:
+        got, err = api_convert(client, str(n), "decimal", "base64")
+        assert err is None
+        assert got == expected_b64, f"Expected little-endian b64 for {n}"
+
+        # And round-trip back to decimal
+        back, err2 = api_convert(client, got, "base64", "decimal")
+        assert err2 is None
+        assert int(back) == n
+
+
+# ---------- Full cross-product across numeric-only types ----------
+NUMERIC_TYPES = ["binary", "octal", "decimal", "hexadecimal", "base64"]
+TEST_NUMBERS = [0, 1, 2, 7, 8, 15, 16, 42, 255, 256, 1024, 65535]
+
+def encode_for_type(n: int, t: str) -> str:
+    if t == "decimal":
+        return str(n)
+    if t == "binary":
+        return bin(n)[2:]
+    if t == "octal":
+        return oct(n)[2:]
+    if t == "hexadecimal":
+        return hex(n)[2:]
+    if t == "base64":
+        return decimal_to_base64_little_endian(n)
+    raise AssertionError(f"unknown type {t}")
+
+@pytest.mark.parametrize("n", TEST_NUMBERS)
+@pytest.mark.parametrize("in_t,out_t", list(itertools.product(NUMERIC_TYPES, NUMERIC_TYPES)))
+def test_all_numeric_type_conversions_roundtrip_via_decimal(n, in_t, out_t):
+    """Exercise all reasonable flows across numeric-only types.
+
+    Strategy: convert input string (typed) -> out_t, then convert back to decimal.
+    The final decimal should equal the original n.
+    """
+    with app.test_client() as client:
+        input_str = encode_for_type(n, in_t)
+        out_str, err = api_convert(client, input_str, in_t, out_t)
+        assert err is None, f"{in_t}->{out_t} failed for {n}: {err}"
+
+        # Normalize by converting out_str back to decimal via API
+        back_dec, err2 = api_convert(client, out_str, out_t, "decimal")
+        assert err2 is None
+        assert int(back_dec) == n
+
+
+# ---------- Identity conversions ----------
+@pytest.mark.parametrize("t", NUMERIC_TYPES + ["text"])
+def test_identity_conversion_returns_equivalent_representation(t):
+    """Converting a value from type t to type t should be equivalent (string-equal or round-trip equal)."""
+    samples = {
+        "decimal": "42",
+        "binary": "101010",
+        "octal": "52",
+        "hexadecimal": "2a",
+        "base64": "Kg==",  # 42 little-endian
+        "text": "forty two",
+    }
+    val = samples[t]
+    with app.test_client() as client:
+        out, err = api_convert(client, val, t, t)
+        assert err is None
+        if t == "text":
+            # Allow formatting differences by round-tripping via decimal
+            back, err2 = api_convert(client, out, t, "decimal")
+            assert err2 is None
+            assert int(back) == 42
+        else:
+            assert out == val
+
+
+# ---------- Error handling (at least 3 distinct errors) ----------
+@pytest.mark.parametrize("bad_input,input_type", [
+    ("10201", "binary"),     # invalid binary digit '2'
+    ("89", "octal"),         # invalid octal digits 8/9
+    ("xyz", "hexadecimal"),  # invalid hex
+    ("***", "base64"),       # not valid base64
+])
+def test_invalid_digits_raise_errors(bad_input, input_type):
+    with app.test_client() as client:
+        out, err = api_convert(client, bad_input, input_type, "decimal")
+        assert out is None
+        assert isinstance(err, str) and err
+
+def test_empty_input_is_error():
+    with app.test_client() as client:
+        out, err = api_convert(client, "", "decimal", "binary")
+        assert out is None
+        assert isinstance(err, str) and err
+
+def test_unknown_input_type_is_error():
+    with app.test_client() as client:
+        out, err = api_convert(client, "42", "romannumeral", "decimal")
+        assert out is None
+        assert isinstance(err, str) and err
+
+def test_missing_fields_is_error():
+    with app.test_client() as client:
+        # Missing outputType field
+        resp = client.post("/convert", data=json.dumps({"input": "42", "inputType": "decimal"}),
+                           content_type="application/json")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["result"] is None and isinstance(data["error"], str)

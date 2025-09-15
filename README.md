@@ -1,3 +1,7 @@
+# The bug that was found
+- Found that the functions base64_to_number/number_to_base64 were using big endian instead of little endian. 
+- Also found bug in function text_to_number where it can only handle inputs that are single digit. For example, fourty-two would not work. 
+
 # Numeric Converter - cs1060-hw2-base
 
 A web-based application that converts numbers between different formats including:
